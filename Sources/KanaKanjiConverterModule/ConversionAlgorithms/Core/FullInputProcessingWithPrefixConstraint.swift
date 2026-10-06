@@ -116,7 +116,6 @@ extension Kana2Kanji {
         let constraintBytes = constraint.constraint
         let constraintLength = constraintBytes.count
         let fixedByteCount = constraint.fixedPrefix?.byteCount ?? 0
-        let enforcesConstraintOnStaticDictionary = !constraint.ignoreMemoryAndUserDictionary
         // 「i文字目から始まるnodes」に対して
         for (isHead, nodeArray) in lattice.indexedNodes(indices: latticeIndices) {
             // それぞれのnodeに対して
@@ -138,8 +137,8 @@ extension Kana2Kanji {
                         constraintBytes: constraintBytes
                     )
                     if nextIndex.surfaceIndex == surfaceCount {
-                        if enforcesConstraintOnStaticDictionary,
-                           node.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
+                        if constraint.ignoreMemoryAndUserDictionary
+                           || node.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
                             let condition = if constraint.hasEOS {
                                 matchState.matched == constraintLength
                                     && matchState.total == constraintLength
@@ -174,8 +173,8 @@ extension Kana2Kanji {
                            current.totalValue >= newValue {
                             continue
                         }
-                        if enforcesConstraintOnStaticDictionary,
-                           nextNode.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
+                        if constraint.ignoreMemoryAndUserDictionary
+                           || nextNode.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
                             guard matchState.matched
                                 == min(matchState.total, constraintLength) else {
                                 continue
@@ -242,8 +241,8 @@ extension Kana2Kanji {
                     }
                     for index in node.prevs.indices {
                         // 学習データやユーザ辞書由来の場合は素通しする
-                        if enforcesConstraintOnStaticDictionary,
-                           node.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
+                        if constraint.ignoreMemoryAndUserDictionary
+                           || node.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
                             let (matched, total) = mtPerPrev[index]
                             // 最終チェック（EOS時の条件に合わせる）
                             let condition = if constraint.hasEOS {
@@ -298,8 +297,8 @@ extension Kana2Kanji {
                             // 制約 AB 単語 A   (OK)
                             // 制約 AB 単語 AC  (NG)
                             // ただし、学習データやユーザ辞書由来の場合は素通しする
-                            if enforcesConstraintOnStaticDictionary,
-                               nextnode.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
+                            if constraint.ignoreMemoryAndUserDictionary
+                               || nextnode.data.metadata.isDisjoint(with: [.isLearned, .isFromUserDictionary]) {
                                 let (matchedPrev, totalPrev) = mtPerPrev[index]
                                 // ensure no prior mismatch
                                 guard matchedPrev == min(totalPrev, constraintLength) else {
