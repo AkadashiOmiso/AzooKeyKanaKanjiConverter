@@ -518,6 +518,110 @@ final class ZenzContext {
         return llama_get_logits(context)
     }
 
+    /// yokiKana（推測修正）: プロンプトに続く候補ごとのトークン列の対数確率（log softmax の和）を出す。各候補の最後のトークンは EOS。
+    /// プロンプトは評価の列（seq 0）に置き、候補の列（2 から）に写す。候補はトライにして、共通の頭のトークンは、それを通る候補の列
+    /// すべてに属する KV のセル 1 つにまとめ、1 回の llama_decode で全部の節の logits を取る（1 回 32 候補まで）。
+    /// 1 件ずつ decode した値と同じになる（yokiKana の engine のテストで確かめる）
+    func trieLogProbabilities(promptTokens: [llama_token], candidates: [[llama_token]]) -> [Float]? {
+        guard !promptTokens.isEmpty else { return nil }
+        let n_vocab = self.vocabSize
+        let eos = self.eosToken
+        guard let promptLogits = self.getLogits(tokens: promptTokens, logits_start_index: promptTokens.count - 1, seqId: evalSeqId) else {
+            return nil
+        }
+        func logSumExp(_ row: UnsafePointer<Float>) -> (max: Float, log: Float) {
+            var maxLogit = row[0]
+            for v in 1 ..< n_vocab where row[v] > maxLogit {
+                maxLogit = row[v]
+            }
+            var sum: Float = 0
+            for v in 0 ..< n_vocab {
+                sum += expf(row[v] - maxLogit)
+            }
+            return (maxLogit, logf(sum))
+        }
+        // プロンプトの最後のトークンの logits（候補の 1 つ目のトークンの確率）。次の decode で上書きされるので写しておく
+        let firstRow = Array(UnsafeBufferPointer(start: promptLogits, count: n_vocab))
+        let firstNorm = firstRow.withUnsafeBufferPointer { logSumExp($0.baseAddress!) }
+        let maxSeqs = 32
+        var batch = llama_batch_init(512, 0, 32)
+        defer { llama_batch_free(batch) }
+        let firstSeq: llama_seq_id = 2
+        let nodeBudget = min(512, Int(llama_n_ctx(self.context)) - promptTokens.count - 8)
+        guard nodeBudget > 0 else { return nil }
+        var out = [Float](repeating: 0, count: candidates.count)
+        var index = 0
+        while index < candidates.count {
+            // トライを作る。節 = (トークン, 深さ, 通る列)。候補の最後のトークン（EOS）は節にしない
+            var nodes: [(token: llama_token, depth: Int, seqs: [llama_seq_id])] = []
+            var children: [[llama_token: Int]] = [[:]]  // 0 は根（プロンプトの最後）
+            var paths: [(candidate: Int, nodes: [Int])] = []
+            while index < candidates.count, paths.count < maxSeqs {
+                let tokens = candidates[index].dropLast()
+                // 増える節の数の上限で、KV のセルと batch に収まるかを見る（1 つ目の候補は必ず載せる）
+                if !paths.isEmpty, nodes.count + tokens.count > nodeBudget { break }
+                if paths.isEmpty, tokens.count > nodeBudget { return nil }
+                let seq = firstSeq + llama_seq_id(paths.count)
+                var parent = 0
+                var path: [Int] = []
+                for (depth, token) in tokens.enumerated() {
+                    if let child = children[parent][token] {
+                        nodes[child - 1].seqs.append(seq)
+                        parent = child
+                    } else {
+                        nodes.append((token, depth, [seq]))
+                        children.append([:])
+                        children[parent][token] = nodes.count
+                        parent = nodes.count
+                    }
+                    path.append(parent)
+                }
+                paths.append((index, path))
+                index += 1
+            }
+            for s in paths.indices {
+                let seq = firstSeq + llama_seq_id(s)
+                llama_kv_cache_seq_rm(context, seq, 0, -1)
+                llama_kv_cache_seq_cp(context, evalSeqId, seq, 0, llama_pos(promptTokens.count))
+            }
+            defer {
+                for s in paths.indices {
+                    llama_kv_cache_seq_rm(context, firstSeq + llama_seq_id(s), 0, -1)
+                }
+            }
+            batch.n_tokens = 0
+            for node in nodes {
+                llama_batch_add(&batch, node.token, llama_pos(promptTokens.count + node.depth), node.seqs, logits: true)
+            }
+            if batch.n_tokens > 0, llama_decode(context, batch) != 0 {
+                debug("llama_decode() failed in trieLogProbabilities")
+                return nil
+            }
+            let logits = llama_get_logits(context)
+            var norms: [Int: (max: Float, log: Float)] = [:]
+            func logProb(afterNode node: Int, _ token: llama_token) -> Float {
+                if node == 0 {
+                    return firstRow[Int(token)] - firstNorm.max - firstNorm.log
+                }
+                let row = logits! + (node - 1) * n_vocab
+                let norm = norms[node] ?? logSumExp(row)
+                norms[node] = norm
+                return row[Int(token)] - norm.max - norm.log
+            }
+            for (candidate, path) in paths {
+                var total: Float = 0
+                var previous = 0
+                for node in path {
+                    total += logProb(afterNode: previous, nodes[node - 1].token)
+                    previous = node
+                }
+                total += logProb(afterNode: previous, eos)
+                out[candidate] = total
+            }
+        }
+        return out
+    }
+
     func previousEvaluationPrompt() -> String {
         self.prevPromptBySeq[evalSeqId] ?? ""
     }

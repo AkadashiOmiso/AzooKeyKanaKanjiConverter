@@ -121,6 +121,66 @@ package final class Zenz {
         }
     }
 
+    /// yokiKana（推測修正）: 読み `convertTarget` に対する候補の表記ごとの対数確率（候補のトークンと最後の EOS の log softmax の和）。
+    /// 本家の `candidateEvaluate` は 1 番目と違うトークンで打ち切り、点も正規化していないので、モデルが選ばない候補の点はこちらで出す。
+    /// `oneByOne` は候補を 1 件ずつ decode する素朴な計算（トライの計算と同じ値になるかを確かめる用）
+    package func logProbabilities(
+        convertTarget: String,
+        candidates: [String],
+        versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode,
+        oneByOne: Bool = false
+    ) -> [Float]? {
+        self.inferenceLock.withLock {
+            guard let context = zenzContext else {
+                return nil
+            }
+            // 次の candidateEvaluate がプロンプトの KV の使い回しを誤らないよう、終わったら前のプロンプトを空にする
+            defer { context.setPreviousEvaluationPrompt("") }
+            let input = convertTarget.toKatakana()
+            let prompt = ZenzPromptBuilder.candidateEvaluationPrompt(
+                input: input,
+                userDictionaryPrompt: "",
+                versionDependentConfig: versionDependentConfig
+            )
+            let promptTokens = context.encode(prompt, addBOS: true, addEOS: false)
+            let lists = candidates.map {
+                context.encode(
+                    ZenzCandidateEvaluator.candidateTextForEvaluation(
+                        candidateText: $0, input: input, inputCursorPosition: nil, versionDependentConfig: versionDependentConfig
+                    ),
+                    addBOS: false, addEOS: false
+                ) + [context.eosToken]
+            }
+            if !oneByOne {
+                return context.trieLogProbabilities(promptTokens: promptTokens, candidates: lists)
+            }
+            let n_vocab = context.vocabSize
+            var out: [Float] = []
+            for list in lists {
+                let tokens = promptTokens + list
+                let startOffset = promptTokens.count - 1
+                guard let logits = context.evaluationLogits(tokens: Array(tokens.dropLast()), startOffset: startOffset) else {
+                    return nil
+                }
+                var total: Float = 0
+                for i in promptTokens.count ..< tokens.count {
+                    let row = logits + (i - 1 - startOffset) * n_vocab
+                    var maxLogit = row[0]
+                    for v in 1 ..< n_vocab where row[v] > maxLogit {
+                        maxLogit = row[v]
+                    }
+                    var sum: Float = 0
+                    for v in 0 ..< n_vocab {
+                        sum += expf(row[v] - maxLogit)
+                    }
+                    total += row[Int(tokens[i])] - maxLogit - logf(sum)
+                }
+                out.append(total)
+            }
+            return out
+        }
+    }
+
     package func pureGreedyDecoding(pureInput: String, maxCount: Int = .max) -> String {
         self.inferenceLock.withLock {
             guard let zenzContext else {
