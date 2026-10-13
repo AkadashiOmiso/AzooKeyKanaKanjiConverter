@@ -391,10 +391,18 @@ final class ZenzContext {
         #else
         let performanceCoreCount: Int? = nil
         #endif
-        return self.selectInferenceThreadCount(
+        let selected = self.selectInferenceThreadCount(
             activeProcessorCount: activeProcessorCount,
             performanceCoreCount: performanceCoreCount
         )
+        #if os(Windows)
+        // yokiKana: Windows では 2 スレッドまでにする。重いコンパイルなどで CPU が埋まると、8 スレッドの barrier 待ちが
+        // ほかのプロセスとぶつかって 1 回の推論が数秒〜数十秒止まり、IME の応答の期限（500ms）を超える。
+        // 2 スレッドなら負荷の下でもライブ変換の 1 文字が最大 0.4 秒ほど、負荷なしでの遅れは中央値で +5ms ほど
+        return min(2, selected)
+        #else
+        return selected
+        #endif
     }
 
     /// DarwinではmacOS/iOSともに最高性能クラスタを優先し、sysctl値を取得できない
